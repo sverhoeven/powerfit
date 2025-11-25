@@ -15,3 +15,5 @@ src/powerfit_em/_powerfit.*.so
 
 .coverage
 coverage.xml
+
+.opencode
