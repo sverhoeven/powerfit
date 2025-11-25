@@ -81,7 +81,7 @@ def transform_rotations(rotations: np.ndarray) -> np.ndarray:
     return rot_trans
 
 
-class GPUCorrelator(Correlator):
+class OpenCLCorrelator(Correlator):
     """Compute the LCC score for a target and template combination."""
 
     def __init__(

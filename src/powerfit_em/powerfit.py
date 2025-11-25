@@ -41,6 +41,8 @@ warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
 
 def make_parser():
+    """Create CLI parser with additional GPU backend option."""
+    """Create CLI parser with additional GPU backend option."""
     """Create the command-line argument parser."""
     p = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 
@@ -164,7 +166,14 @@ def make_parser():
         const="0:0",
         default=None,
         metavar="[<platform>:<device>]",
-        help="Off-load the intensive calculations to the GPU. Optionally specify platform and device as <platform>:<device> (e.g., --gpu 0:3). If not specified, uses first device in first platform. If omitted, does not use GPU.",  # noqa: E501
+        help="Off-load the intensive calculations to the GPU. Optionally specify platform and device as <platform>:<device> (e.g., --gpu 0:3). If not specified, uses first device in first platform. If omitted, does not use GPU.",
+    )
+    p.add_argument(
+        "--gpu-backend",
+        dest="gpu_backend",
+        choices=["cuda", "opencl"],
+        default=None,
+        help="Force selection of GPU backend. Requires corresponding optional dependencies.",
     )
     p.add_argument(
         "-p",
@@ -417,9 +426,10 @@ def powerfit(
     directory: str = ".",
     num: int = 10,
     gpu: str | None = None,
+    gpu_backend: str | None = None,
     nproc: int = 1,
     delimiter: str | None = None,
-    progress: partial[tqdm] | None = tqdm,
+    progress: Any = None,
 ):
     time0 = time()
     Path(directory).mkdir(exist_ok=True)

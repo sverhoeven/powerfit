@@ -10,6 +10,8 @@ def pyfftw_available() -> bool:
 
 
 def opencl_available() -> bool:
+    """Return True if pyopencl is installed."""
+
     return find_spec("pyopencl") is not None
 
 
