@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pooch
 import pytest
 from pandas.testing import assert_frame_equal
 from tqdm.rich import tqdm as rich_tqdm
@@ -13,17 +14,32 @@ from powerfit_em import powerfit
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
-# The fixtures below where copied from https://github.com/haddocking/powerfit-tutorial
+
+def _fetch_tutorial_fixture(filename: str, sha256: str) -> Path:
+    base_url = "https://github.com/haddocking/powerfit-tutorial/raw/master"
+    path = pooch.retrieve(
+        url=f"{base_url}/{filename}",
+        known_hash=f"sha256:{sha256}",
+        fname=filename,
+        path=pooch.os_cache("powerfit-test-fixtures"),
+    )
+    return Path(path)
 
 
 @pytest.fixture(scope="session")
 def ribosome_map() -> Path:
-    return FIXTURES_DIR / "ribosome-KsgA.map"
+    return _fetch_tutorial_fixture(
+        filename="ribosome-KsgA.map",
+        sha256="609fb54903dad68eb02638bdd0ecf175016d585d5b73dbee464fed0e4ed4470d",
+    )
 
 
 @pytest.fixture(scope="session")
 def ksga_pdb() -> Path:
-    return FIXTURES_DIR / "KsgA.pdb"
+    return _fetch_tutorial_fixture(
+        filename="KsgA.pdb",
+        sha256="6bc1eb01fffc56a855b9d65378810e0fe2da678fadf2a1f1021f9fc8499fd710",
+    )
 
 
 @pytest.fixture(scope="session")
