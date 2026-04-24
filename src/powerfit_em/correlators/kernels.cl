@@ -77,3 +77,117 @@ void rotate_image3d(
         }
     }
 }
+
+
+kernel
+void rotate_image3d_batch(
+        read_only image3d_t image,
+        sampler_t sampler,
+        global const float *rotmats,
+        int rot_offset,
+        int batch_size,
+        global float *out
+        )
+{
+    int b = get_global_id(0);
+    if (b >= batch_size)
+        return;
+
+    int rbase = (rot_offset + b) * 16;
+    float16 rotmat = (float16)(
+        rotmats[rbase + 0], rotmats[rbase + 1], rotmats[rbase + 2], rotmats[rbase + 3],
+        rotmats[rbase + 4], rotmats[rbase + 5], rotmats[rbase + 6], rotmats[rbase + 7],
+        rotmats[rbase + 8], rotmats[rbase + 9], rotmats[rbase + 10], rotmats[rbase + 11],
+        rotmats[rbase + 12], rotmats[rbase + 13], rotmats[rbase + 14], rotmats[rbase + 15]
+    );
+
+    float4 dist2, coor_z, coor_zy, coor_zyx, fshape;
+    int4 out_ind;
+    int out_base = b * SIZE;
+    fshape.s2 = (float) SHAPE_X;
+    fshape.s1 = (float) SHAPE_Y;
+    fshape.s0 = (float) SHAPE_Z;
+
+    for (int z = -LLENGTH; z <= LLENGTH; ++z) {
+        dist2.s2 = SQUARE(z);
+
+        coor_z.s0 = rotmat.s6 * z + IMAGE_OFFSET;
+        coor_z.s1 = rotmat.s7 * z + IMAGE_OFFSET;
+        coor_z.s2 = rotmat.s8 * z + IMAGE_OFFSET;
+
+        out_ind.s0 = out_base + z * SLICE;
+        if (z < 0)
+            out_ind.s0 += SIZE;
+
+        for (int y = -LLENGTH; y <= LLENGTH; ++y) {
+            dist2.s1 = SQUARE(y) + dist2.s2;
+            if (dist2.s1 > LLENGTH2)
+                continue;
+
+            coor_zy.s0 = rotmat.s3 * y + coor_z.s0;
+            coor_zy.s1 = rotmat.s4 * y + coor_z.s1;
+            coor_zy.s2 = rotmat.s5 * y + coor_z.s2;
+
+            out_ind.s1 = out_ind.s0 + y * SHAPE_X;
+            if (y < 0)
+                out_ind.s1 += SLICE;
+
+            for (int x = -LLENGTH; x <= LLENGTH; ++x) {
+                dist2.s0 = SQUARE(x) + dist2.s1;
+                if (dist2.s0 > LLENGTH2)
+                    continue;
+
+                coor_zyx.s0 = (rotmat.s0 * x + coor_zy.s0) / fshape.s2;
+                coor_zyx.s1 = (rotmat.s1 * x + coor_zy.s1) / fshape.s1;
+                coor_zyx.s2 = (rotmat.s2 * x + coor_zy.s2) / fshape.s0;
+
+                out_ind.s2 = out_ind.s1 + x;
+                if (x < 0)
+                    out_ind.s2 += SHAPE_X;
+
+                out[out_ind.s2] = read_imagef(image, sampler, coor_zyx).s0;
+            }
+        }
+    }
+}
+
+
+kernel
+void powerfit_batch_lcc_and_take_best(
+        global const float *gcc,
+        global const float *ave,
+        global const float *ave2,
+        global const int *mask,
+        global float *lcc,
+        global int *grot,
+        float norm_factor,
+        int batch_start,
+        int batch_size,
+        int volume_size
+        )
+{
+    int i = get_global_id(0);
+    if (i >= volume_size)
+        return;
+
+    if (mask[i] == 0)
+        return;
+
+    float best_lcc = lcc[i];
+    int best_rot = grot[i];
+
+    for (int b = 0; b < batch_size; ++b) {
+        int idx = b * volume_size + i;
+        float var = ave2[idx] * norm_factor - ave[idx] * ave[idx];
+        if (var > 0.0f) {
+            float score = gcc[idx] / sqrt(var);
+            if (score > best_lcc) {
+                best_lcc = score;
+                best_rot = batch_start + b;
+            }
+        }
+    }
+
+    lcc[i] = best_lcc;
+    grot[i] = best_rot;
+}

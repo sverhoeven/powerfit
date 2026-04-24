@@ -74,10 +74,10 @@ def add_computational_resources2parser(p: ArgumentParser):
         default=None,
         metavar="<int>",
         help=(
-            "Override the auto-tuned CUDA batch size. "
+            "Override the auto-tuned GPU batch size. "
             "Use 0 to disable batching entirely, or a positive integer to force a specific batch size. "
-            "Only applies with the CUDA backend. "
-            "Default: auto-tuned based on available VRAM."
+            "Applies to GPU backends (CUDA/OpenCL). "
+            "Default: auto-tuned based on available VRAM/device memory."
         ),
     )
 
@@ -423,8 +423,8 @@ def powerfit(
 
     opencl_queue, cuda_stream = setup_gpu_backend(gpu)
 
-    if batch_size is not None and cuda_stream is None:
-        raise ValueError("--batch-size only applies to the CUDA backend. Use --gpu cuda:N to enable CUDA.")
+    if batch_size is not None and opencl_queue is None and cuda_stream is None:
+        raise ValueError("--batch-size only applies to GPU backends. Set --gpu to use CUDA or OpenCL.")
 
     target = setup_target(target_volume, resolution, no_resampling, resampling_rate, no_trimming, trimming_cutoff)
     structure, template, mask, z_sigma = setup_template_structure(
@@ -518,7 +518,7 @@ def powerfit_many(
             "cuda:N" for CUDA device N, or "P:D" for OpenCL platform P and device D. If None, does not use GPU.
         reuse: Whether to reuse GPU resources (OpenCL queues, CUDA streams) across multiple template structures.
         nproc: Number of processors used during search.
-        batch_size: Override the auto-tuned CUDA batch size.
+        batch_size: Override the auto-tuned GPU batch size.
             Use 0 to disable batching entirely, or a positive integer to force a specific batch size.
 
     Returns:
@@ -532,8 +532,8 @@ def powerfit_many(
 
     opencl_queue, cuda_stream = setup_gpu_backend(gpu)
 
-    if batch_size is not None and cuda_stream is None:
-        raise ValueError("--batch-size only applies to the CUDA backend.")
+    if batch_size is not None and opencl_queue is None and cuda_stream is None:
+        raise ValueError("--batch-size only applies to GPU backends.")
 
     with target_volume.open("rb") as f:
         target = setup_target(

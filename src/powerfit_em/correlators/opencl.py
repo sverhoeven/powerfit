@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import pyopencl as cl
 import pyopencl.array as cl_array
@@ -17,6 +19,12 @@ from powerfit_em.correlators.shared import (
     get_lcc_mask,
     i32,
 )
+
+# Conservative batch-memory target for auto sizing on OpenCL devices.
+_BATCH_MEM_TARGET = 0.70
+
+
+logger = logging.getLogger(__name__)
 
 
 def init_gpu_vars(
@@ -90,6 +98,47 @@ def build_opencl_ffts(shape: tuple[int, ...], queue: cl.CommandQueue):
     return rfftn, irfftn
 
 
+def build_opencl_ffts_batched(vol_shape: tuple[int, ...], batch_size: int, queue: cl.CommandQueue):
+    """Build batched 3D FFT wrappers over a leading batch axis."""
+    plan = VkFFTApp(
+        (batch_size,) + tuple(vol_shape),
+        np.float32,
+        queue,
+        ndim=3,
+        inplace=False,
+        r2c=True,
+        norm=1,
+    )
+
+    def rfftn_batch(src, dst):
+        plan.fft(src, dst, queue=queue)
+
+    def irfftn_batch(src, dst):
+        plan.ifft(src, dst, queue=queue)
+
+    return rfftn_batch, irfftn_batch
+
+
+def _probe_batch_size(queue: cl.CommandQueue, vol_shape: tuple[int, int, int]) -> int:
+    """Estimate an OpenCL batch size from device memory limits."""
+    z, y, x = vol_shape
+    ft_x = x // 2 + 1
+    real_bytes = z * y * x * np.dtype(np.float32).itemsize
+    complex_bytes = z * y * ft_x * np.dtype(np.complex64).itemsize
+    bytes_per_rot = 6 * real_bytes + 6 * complex_bytes
+
+    global_mem = int(queue.device.global_mem_size)
+    max_alloc = int(queue.device.max_mem_alloc_size)
+    budget = int(global_mem * _BATCH_MEM_TARGET)
+    by_total = budget // bytes_per_rot
+    by_alloc_real = max_alloc // real_bytes
+    by_alloc_complex = max_alloc // complex_bytes
+    batch_size = min(by_total, by_alloc_real, by_alloc_complex)
+    if batch_size < 1:
+        raise RuntimeError("Unable to auto-tune a valid OpenCL batch size for this device.")
+    return int(batch_size)
+
+
 def precompute_squared_targets(
     gpu_vars: Vars[ClArray, Image],
     gpu_vars_ft: VarsFT[ClArray],
@@ -124,6 +173,7 @@ class OpenCLCorrelator(Correlator):
         mask: np.ndarray,
         queue: cl.CommandQueue,
         laplace: bool = False,
+        batch_size: int | None = None,
     ):
         """Initialize the GPU correlator.
 
@@ -138,6 +188,9 @@ class OpenCLCorrelator(Correlator):
             queue: the OpenCL command queue on which to execute the computations.
             laplace: if true, a Laplace pre-filter is applied to the target density and
                 template to enhance the sensitivity of the scoring function.
+            batch_size: If >0, use this fixed batch size for processing rotations.
+                If 0, disable batching and process rotations one-by-one.
+                If None, auto-tune a batch size from OpenCL device memory limits.
         """
         self.target: np.ndarray = target / target.max()
         self.laplace = laplace
@@ -146,19 +199,56 @@ class OpenCLCorrelator(Correlator):
         self.norm_factor = 0.0  # to be set by set_template
 
         self._rotations = transform_rotations(rotations)
+        self._volume_size = int(np.prod(self.target.shape))
 
         self.vars, self.vars_ft = init_gpu_vars(queue, self.target, self.laplace)
 
         self.lcc = np.zeros(self.target.shape, dtype=np.float32)
         self.rot = np.zeros(self.target.shape, dtype=np.int32)
 
-        self.set_template(template, mask)
-
         self.cl_kernels = generate_kernels(queue, self.target)
         self.conj_multiply = self.cl_kernels.conj_multiply
         self.square = lambda a, b: self.cl_kernels.multiply(a, a, b)
         self.rfftn, self.irfftn = build_opencl_ffts(self.target.shape, queue)
+
+        if batch_size == 0:
+            self._use_batch = False
+            self.batch_size = 1
+        else:
+            self._use_batch = True
+            if batch_size is None:
+                self.batch_size = _probe_batch_size(queue, self.target.shape)
+            else:
+                if batch_size < 0:
+                    raise ValueError("batch_size must be >= 0.")
+                self.batch_size = batch_size
+            self._allocate_batch_buffers(self.batch_size)
+            self._rfftn_batch, self._irfftn_batch = build_opencl_ffts_batched(self.target.shape, self.batch_size, queue)
+
+        self.set_template(template, mask)
         precompute_squared_targets(self.vars, self.vars_ft, self.cl_kernels, self.rfftn)
+
+    def _allocate_batch_buffers(self, batch_size: int):
+        """Allocate all OpenCL batch buffers; raises on allocation failure."""
+        vol = self.target.shape
+        ft = get_ft_shape(self.target)
+        bvol = (batch_size,) + vol
+        bft = (batch_size,) + ft
+        try:
+            self._batch_rot_template = cl_array.zeros(self.queue, bvol, dtype=f32)
+            self._batch_rot_mask = cl_array.zeros(self.queue, bvol, dtype=f32)
+            self._batch_rot_mask2 = cl_array.zeros(self.queue, bvol, dtype=f32)
+            self._batch_gcc = cl_array.zeros(self.queue, bvol, dtype=f32)
+            self._batch_ave = cl_array.zeros(self.queue, bvol, dtype=f32)
+            self._batch_ave2 = cl_array.zeros(self.queue, bvol, dtype=f32)
+            self._batch_template_ft = cl_array.zeros(self.queue, bft, dtype=np.complex64)
+            self._batch_mask_ft = cl_array.zeros(self.queue, bft, dtype=np.complex64)
+            self._batch_mask2_ft = cl_array.zeros(self.queue, bft, dtype=np.complex64)
+            self._batch_gcc_ft = cl_array.zeros(self.queue, bft, dtype=np.complex64)
+            self._batch_ave_ft = cl_array.zeros(self.queue, bft, dtype=np.complex64)
+            self._batch_ave2_ft = cl_array.zeros(self.queue, bft, dtype=np.complex64)
+        except cl.MemoryError as exc:
+            raise RuntimeError(f"Failed to allocate OpenCL batch buffers for batch_size={batch_size}.") from exc
 
     def _set_template_var(self, template: np.ndarray):
         self.vars.template = cl.image_from_array(self.vars.template.context, template.astype(f32))
@@ -188,6 +278,63 @@ class OpenCLCorrelator(Correlator):
             self.vars.rot,
         )
 
+    def _compute_batch(self, batch_start: int, batch_size: int):
+        """Compute correlation for a batch of rotations and reduce to global best."""
+        if batch_size > self.batch_size:
+            raise ValueError("batch_size exceeds allocated OpenCL batch buffers.")
+
+        rotmats = cl_array.to_device(self.queue, self._rotations[batch_start : batch_start + batch_size])
+        self._batch_rot_template.fill(0)
+        self._batch_rot_mask.fill(0)
+
+        self.cl_kernels.rotate_image3d_batch(
+            self.queue,
+            self.vars.template,
+            rotmats,
+            0,
+            batch_size,
+            self._batch_rot_template,
+        )
+        self.cl_kernels.rotate_image3d_batch(
+            self.queue,
+            self.vars.mask,
+            rotmats,
+            0,
+            batch_size,
+            self._batch_rot_mask,
+            nearest=True,
+        )
+
+        self._rfftn_batch(self._batch_rot_template, self._batch_template_ft)
+        for b in range(batch_size):
+            self.conj_multiply(self._batch_template_ft[b], self.vars_ft.target, self._batch_gcc_ft[b])
+        self._irfftn_batch(self._batch_gcc_ft, self._batch_gcc)
+
+        self._rfftn_batch(self._batch_rot_mask, self._batch_mask_ft)
+        for b in range(batch_size):
+            self.conj_multiply(self._batch_mask_ft[b], self.vars_ft.target, self._batch_ave_ft[b])
+        self._irfftn_batch(self._batch_ave_ft, self._batch_ave)
+
+        self.square(self._batch_rot_mask, self._batch_rot_mask2)
+        self._rfftn_batch(self._batch_rot_mask2, self._batch_mask2_ft)
+        for b in range(batch_size):
+            self.conj_multiply(self._batch_mask2_ft[b], self.vars_ft.target2, self._batch_ave2_ft[b])
+        self._irfftn_batch(self._batch_ave2_ft, self._batch_ave2)
+
+        self.cl_kernels.batch_lcc_and_take_best(
+            self.queue,
+            self._batch_gcc,
+            self._batch_ave,
+            self._batch_ave2,
+            self.vars.lcc_mask,
+            self.vars.lcc,
+            self.vars.rot,
+            np.float32(self.norm_factor),
+            batch_start,
+            batch_size,
+            self._volume_size,
+        )
+
     def retrieve_results(self):
         """Retrieve the results from the GPU."""
         self.vars.lcc.get(ary=self.lcc)
@@ -199,11 +346,28 @@ class OpenCLCorrelator(Correlator):
         self.vars.lcc.fill(0)
         self.vars.rot.fill(0)
 
-        _range = range(0, self._rotations.shape[0])
-        if progress is None:
+        n_rot = self._rotations.shape[0]
+        _range = range(0, n_rot)
+        if progress is None and self._use_batch:
+            batch = self.batch_size
+            n_full = n_rot // batch
+            logger.info(f"Batching {n_rot} rotations into {n_full} batches. Batch size: {batch}.")
+            for chunk in range(n_full):
+                base = chunk * batch
+                self._compute_batch(base, batch)
+            for n in range(n_full * batch, n_rot):
+                self.compute_rotation(n, self._rotations[n])
+        elif progress is None:
+            logger.info(f"Processing {n_rot} rotations without batching.")
             for n in _range:
                 self.compute_rotation(n, self._rotations[n])
         else:
+            if self._use_batch:
+                logger.info(
+                    "Progress mode enabled: OpenCL scan is currently processing rotations one-by-one without batching."
+                )
+            else:
+                logger.info(f"Processing {n_rot} rotations without batching.")
             for n in progress(_range):
                 self.compute_rotation(n, self._rotations[n])
                 self.queue.finish()

@@ -123,6 +123,7 @@ class PowerFitter:
                 self._mask.array,
                 self._queue,
                 self._laplace,
+                batch_size=self._batch_size,
             )
         self._corr.scan(progress)
         self._lcc = self._corr.lcc

@@ -1,6 +1,7 @@
 import importlib.resources
 from string import Template
 
+import numpy as np
 import pyopencl as cl
 from pyopencl.elementwise import ElementwiseKernel
 
@@ -35,7 +36,10 @@ class CLKernels:
 
         self._program = cl.Program(ctx, t).build()
         self._rotate_image3d = self._program.rotate_image3d
+        self._rotate_image3d_batch = self._program.rotate_image3d_batch
+        self._batch_lcc_and_take_best = self._program.powerfit_batch_lcc_and_take_best
         self._gws_rotate_grid3d = (96, 64, 1)
+        self._gws_rotate_grid3d_batch = None
 
     def rotate_image3d(self, queue: cl.CommandQueue, image, rotmat, out, nearest=False):
         if nearest:
@@ -43,3 +47,54 @@ class CLKernels:
         else:
             args = (image, self.sampler_linear, rotmat, out.data)
         self._rotate_image3d(queue, self._gws_rotate_grid3d, None, *args)
+
+    def rotate_image3d_batch(
+        self,
+        queue: cl.CommandQueue,
+        image,
+        rotmats,
+        rot_offset: int,
+        batch_size: int,
+        out,
+        nearest: bool = False,
+    ):
+        rot_offset_i32 = np.int32(rot_offset)
+        batch_size_i32 = np.int32(batch_size)
+        if nearest:
+            args = (image, self.sampler_nearest, rotmats.data, rot_offset_i32, batch_size_i32, out.data)
+        else:
+            args = (image, self.sampler_linear, rotmats.data, rot_offset_i32, batch_size_i32, out.data)
+        gws = (batch_size, 1, 1)
+        self._rotate_image3d_batch(queue, gws, None, *args)
+
+    def batch_lcc_and_take_best(
+        self,
+        queue: cl.CommandQueue,
+        gcc,
+        ave,
+        ave2,
+        mask,
+        lcc,
+        rot,
+        norm_factor,
+        batch_start: int,
+        batch_size: int,
+        volume_size: int,
+    ):
+        block = 256
+        gws = ((volume_size + block - 1) // block * block,)
+        self._batch_lcc_and_take_best(
+            queue,
+            gws,
+            None,
+            gcc.data,
+            ave.data,
+            ave2.data,
+            mask.data,
+            lcc.data,
+            rot.data,
+            norm_factor,
+            np.int32(batch_start),
+            np.int32(batch_size),
+            np.int32(volume_size),
+        )
